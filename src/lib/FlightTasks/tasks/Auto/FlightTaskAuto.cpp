@@ -66,6 +66,10 @@ bool FlightTaskAuto::initializeSubscriptions(SubscriptionArray &subscription_arr
 		return false;
 	}
 
+	if (!subscription_array.get(ORB_ID(manual_control_setpoint), _sub_manual_control_setpoint)) {
+		return false;
+	}
+
 	if (!_obstacle_avoidance.initializeSubscriptions(subscription_array)) {
 		return false;
 	}
@@ -114,6 +118,8 @@ void FlightTaskAuto::_limitYawRate()
 {
 	const float yawrate_max = math::radians(_param_mpc_yawrauto_max.get());
 
+	_yaw_sp_aligned = true;
+
 	if (PX4_ISFINITE(_yaw_setpoint) && PX4_ISFINITE(_yaw_sp_prev)) {
 		// Limit the rate of change of the yaw setpoint
 		const float dyaw_desired = matrix::wrap_pi(_yaw_setpoint - _yaw_sp_prev);
@@ -122,10 +128,16 @@ void FlightTaskAuto::_limitYawRate()
 		_yaw_setpoint = _yaw_sp_prev + dyaw;
 		_yaw_setpoint = matrix::wrap_pi(_yaw_setpoint);
 		_yaw_sp_prev = _yaw_setpoint;
+
+		// The yaw setpoint is aligned when its rate is not saturated
+		_yaw_sp_aligned = fabsf(dyaw_desired) < fabsf(dyaw_max);
 	}
 
 	if (PX4_ISFINITE(_yawspeed_setpoint)) {
 		_yawspeed_setpoint = math::constrain(_yawspeed_setpoint, -yawrate_max, yawrate_max);
+
+		// The yaw setpoint is aligned when its rate is not saturated
+		_yaw_sp_aligned = fabsf(_yawspeed_setpoint) < yawrate_max;
 	}
 }
 
@@ -178,10 +190,12 @@ bool FlightTaskAuto::_evaluateTriplets()
 		} else {
 			tmp_target(0) = _lock_position_xy(0);
 			tmp_target(1) = _lock_position_xy(1);
-			_lock_position_xy.setAll(NAN);
 		}
 
 	} else {
+		// reset locked position if current lon and lat are valid
+		_lock_position_xy.setAll(NAN);
+
 		// Convert from global to local frame.
 		map_projection_project(&_reference_position,
 				       _sub_triplet_setpoint->get().current.lat, _sub_triplet_setpoint->get().current.lon, &tmp_target(0), &tmp_target(1));
@@ -272,13 +286,15 @@ bool FlightTaskAuto::_evaluateTriplets()
 		_mission_gear = _sub_triplet_setpoint->get().current.landing_gear;
 	}
 
-	if (_param_com_obs_avoid.get() && _sub_vehicle_status->get().is_rotary_wing) {
+	if (_param_com_obs_avoid.get()
+	    && _sub_vehicle_status->get().vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
 		_obstacle_avoidance.updateAvoidanceDesiredWaypoints(_triplet_target, _yaw_setpoint, _yawspeed_setpoint,
 				_triplet_next_wp,
 				_sub_triplet_setpoint->get().next.yaw,
-				_sub_triplet_setpoint->get().next.yawspeed_valid ? _sub_triplet_setpoint->get().next.yawspeed : NAN);
-		_obstacle_avoidance.updateAvoidanceDesiredSetpoints(_position_setpoint, _velocity_setpoint);
-		_obstacle_avoidance.checkAvoidanceProgress(_position, _triplet_prev_wp, _target_acceptance_radius, _closest_pt);
+				_sub_triplet_setpoint->get().next.yawspeed_valid ? _sub_triplet_setpoint->get().next.yawspeed : NAN,
+				_ext_yaw_handler != nullptr && _ext_yaw_handler->is_active());
+		_obstacle_avoidance.checkAvoidanceProgress(_position, _triplet_prev_wp, _target_acceptance_radius, _closest_pt,
+				_sub_triplet_setpoint->get().current.type);
 	}
 
 	return true;
@@ -292,6 +308,7 @@ void FlightTaskAuto::_set_heading_from_mode()
 	switch (_param_mpc_yaw_mode.get()) {
 
 	case 0: // Heading points towards the current waypoint.
+	case 4: // Same as 0 but yaw fisrt and then go
 		v = Vector2f(_target) - Vector2f(_position);
 		break;
 
