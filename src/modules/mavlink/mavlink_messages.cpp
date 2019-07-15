@@ -74,6 +74,7 @@
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/mavlink_log.h>
 #include <uORB/topics/vehicle_trajectory_waypoint.h>
+#include <uORB/topics/obstacle_distance.h>
 #include <uORB/topics/optical_flow.h>
 #include <uORB/topics/orbit_status.h>
 #include <uORB/topics/position_controller_status.h>
@@ -153,7 +154,7 @@ void get_mavlink_navigation_mode(const struct vehicle_status_s *const status, ui
 	switch (status->nav_state) {
 	case vehicle_status_s::NAVIGATION_STATE_MANUAL:
 		*mavlink_base_mode	|= MAV_MODE_FLAG_MANUAL_INPUT_ENABLED
-					   | (status->is_rotary_wing ? MAV_MODE_FLAG_STABILIZE_ENABLED : 0);
+					   | (status->vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING ? MAV_MODE_FLAG_STABILIZE_ENABLED : 0);
 		custom_mode->main_mode = PX4_CUSTOM_MAIN_MODE_MANUAL;
 		break;
 
@@ -4284,7 +4285,7 @@ protected:
 			updated = true;
 
 			if (status.is_vtol) {
-				if (!status.in_transition_mode && status.is_rotary_wing) {
+				if (!status.in_transition_mode && status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
 					_msg.vtol_state = MAV_VTOL_STATE_MC;
 
 				} else if (!status.in_transition_mode) {
@@ -4834,6 +4835,80 @@ protected:
 	}
 };
 
+class MavlinkStreamObstacleDistance : public MavlinkStream
+{
+public:
+	const char *get_name() const
+	{
+		return MavlinkStreamObstacleDistance::get_name_static();
+	}
+
+	static const char *get_name_static()
+	{
+		return "OBSTACLE_DISTANCE";
+	}
+
+	static uint16_t get_id_static()
+	{
+		return MAVLINK_MSG_ID_OBSTACLE_DISTANCE;
+	}
+
+	uint16_t get_id()
+	{
+		return get_id_static();
+	}
+
+	static MavlinkStream *new_instance(Mavlink *mavlink)
+	{
+		return new MavlinkStreamObstacleDistance(mavlink);
+	}
+
+	unsigned get_size()
+	{
+		return _obstacle_distance_fused_sub->is_published() ? (MAVLINK_MSG_ID_OBSTACLE_DISTANCE_LEN +
+				MAVLINK_NUM_NON_PAYLOAD_BYTES) :
+		       0;
+	}
+
+private:
+	MavlinkOrbSubscription *_obstacle_distance_fused_sub;
+	uint64_t _obstacle_distance_time;
+
+	/* do not allow top copying this class */
+	MavlinkStreamObstacleDistance(MavlinkStreamObstacleDistance &) = delete;
+	MavlinkStreamObstacleDistance &operator = (const MavlinkStreamObstacleDistance &) = delete;
+
+protected:
+	explicit MavlinkStreamObstacleDistance(Mavlink *mavlink) : MavlinkStream(mavlink),
+		_obstacle_distance_fused_sub(_mavlink->add_orb_subscription(ORB_ID(obstacle_distance_fused))),
+		_obstacle_distance_time(0)
+	{}
+
+	bool send(const hrt_abstime t)
+	{
+		obstacle_distance_s obstacke_distance;
+
+		if (_obstacle_distance_fused_sub->update(&_obstacle_distance_time, &obstacke_distance)) {
+			mavlink_obstacle_distance_t msg = {};
+
+			msg.time_usec = obstacke_distance.timestamp;
+			msg.sensor_type = obstacke_distance.sensor_type;
+			memcpy(msg.distances, obstacke_distance.distances, sizeof(msg.distances));
+			msg.increment = 0;
+			msg.min_distance = obstacke_distance.min_distance;
+			msg.max_distance = obstacke_distance.max_distance;
+			msg.angle_offset = obstacke_distance.angle_offset;
+			msg.increment_f = obstacke_distance.increment;
+
+			mavlink_msg_obstacle_distance_send_struct(_mavlink->get_channel(), &msg);
+
+			return true;
+		}
+
+		return false;
+	}
+};
+
 static const StreamListItem streams_list[] = {
 	StreamListItem(&MavlinkStreamHeartbeat::new_instance, &MavlinkStreamHeartbeat::get_name_static, &MavlinkStreamHeartbeat::get_id_static),
 	StreamListItem(&MavlinkStreamStatustext::new_instance, &MavlinkStreamStatustext::get_name_static, &MavlinkStreamStatustext::get_id_static),
@@ -4891,7 +4966,8 @@ static const StreamListItem streams_list[] = {
 	StreamListItem(&MavlinkStreamHighLatency2::new_instance, &MavlinkStreamHighLatency2::get_name_static, &MavlinkStreamHighLatency2::get_id_static),
 	StreamListItem(&MavlinkStreamGroundTruth::new_instance, &MavlinkStreamGroundTruth::get_name_static, &MavlinkStreamGroundTruth::get_id_static),
 	StreamListItem(&MavlinkStreamPing::new_instance, &MavlinkStreamPing::get_name_static, &MavlinkStreamPing::get_id_static),
-	StreamListItem(&MavlinkStreamOrbitStatus::new_instance, &MavlinkStreamOrbitStatus::get_name_static, &MavlinkStreamOrbitStatus::get_id_static)
+	StreamListItem(&MavlinkStreamOrbitStatus::new_instance, &MavlinkStreamOrbitStatus::get_name_static, &MavlinkStreamOrbitStatus::get_id_static),
+	StreamListItem(&MavlinkStreamObstacleDistance::new_instance, &MavlinkStreamObstacleDistance::get_name_static, &MavlinkStreamObstacleDistance::get_id_static)
 };
 
 const char *get_stream_name(const uint16_t msg_id)
